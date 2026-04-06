@@ -289,7 +289,7 @@ async fn main() {
     log.log(&format!("=== MA 均线筛选策略启动 ==="), "INFO", Some("cyan"));
     log.log(&format!("Web 面板: http://0.0.0.0:{} ({}/***)", web_port, web_user), "INFO", Some("green"));
 
-    // 初始化交易所客户端
+    // 初始化交易所客户端（主循环用）
     let bitget_config = BitgetConfig::new(
         &config.exchange.key,
         &config.exchange.secret,
@@ -297,6 +297,15 @@ async fn main() {
         "swap",
     );
     let rest = BitgetRestClient::new(bitget_config).expect("REST 客户端初始化失败");
+
+    // 第二个客户端（持仓轮询用）
+    let bitget_config2 = BitgetConfig::new(
+        &config.exchange.key,
+        &config.exchange.secret,
+        &config.exchange.passphrase,
+        "swap",
+    );
+    let rest2 = BitgetRestClient::new(bitget_config2).expect("REST 客户端2初始化失败");
 
     // 初始化策略
     let mut state = StrategyState::new(config.strategy);
@@ -325,6 +334,19 @@ async fn main() {
 
     // 启动时同步真实持仓
     sync_positions_from_exchange(&rest, &log, &mut state).await;
+
+    // 启动持仓轮询任务（每5秒更新持仓到Web面板）
+    let web_poll = web.clone();
+    tokio::spawn(async move {
+        loop {
+            // 查真实持仓
+            let pos_result = rest2.get_positions().await;
+            if let Some(positions) = pos_result.get("Ok").and_then(|v| v.as_array()) {
+                web_poll.update_positions(json!(positions));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 
     // ==================== 主循环 ====================
     loop {
