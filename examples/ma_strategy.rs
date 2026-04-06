@@ -439,14 +439,17 @@ async fn sync_positions_from_exchange(
         let side_raw = p.get("side").and_then(|v| v.as_str()).unwrap_or("");
         let side = if side_raw == "Long" || side_raw == "long" { "long" } else { "short" };
         let entry = p.get("entry_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let leverage = p.get("leverage").and_then(|v| v.as_f64()).unwrap_or(state.leverage as f64);
         let coin = sym.replace("_USDT", "");
+        // 名义值 = entry * amount，保证金 = 名义值 / 杠杆
+        let margin = if leverage > 0.0 { entry * amount / leverage } else { entry * amount };
 
         state.positions.insert(sym.to_string(), PositionInfo {
             symbol: sym.to_string(),
             coin: coin.clone(),
             side: side.into(),
             entry_price: entry,
-            amount: entry * amount,  // 近似 USDT 价值
+            amount: margin,
             open_time: timestamp_ms(),
             max_pnl_pct: 0.0,
             best_fast: 5,
@@ -586,12 +589,29 @@ async fn calc_signals(
 ) -> HashMap<String, String> {
     let mut signals: HashMap<String, String> = HashMap::new(); // symbol -> "long"/"short"
 
-    if state.whitelist.is_empty() { return signals; }
+    if state.whitelist.is_empty() && state.positions.is_empty() { return signals; }
 
-    log.log(&format!("[计算信号] 白名单: {} 个 | 允许做空: {}",
-        state.whitelist.len(), state.allow_short), "INFO", None);
+    log.log(&format!("[计算信号] 白名单: {} 个 | 持仓: {} 个 | 允许做空: {}",
+        state.whitelist.len(), state.positions.len(), state.allow_short), "INFO", None);
 
-    for item in &state.whitelist {
+    // 合并白名单 + 已持仓的币（防止白名单变化导致意外平仓）
+    let mut check_list: Vec<WhitelistItem> = state.whitelist.clone();
+    for (sym, pos) in &state.positions {
+        if !check_list.iter().any(|w| w.symbol == *sym) {
+            check_list.push(WhitelistItem {
+                symbol: sym.clone(),
+                coin: pos.coin.clone(),
+                score: 0.0,
+                win_rate: 0.0,
+                profit_factor: 0.0,
+                max_dd: 0.0,
+                best_fast: pos.best_fast,
+                best_slow: pos.best_slow,
+            });
+        }
+    }
+
+    for item in &check_list {
         let kline_result = rest.get_klines(&item.symbol, "1h", (item.best_slow + 5) as u32).await;
         let klines = match kline_result.get("Ok").and_then(|v| v.as_array()) {
             Some(arr) => arr,
@@ -624,16 +644,26 @@ async fn calc_signals(
             log.log(&format!("  [信号] {} 死叉 MA{}/{} | 差值: {:.4}%",
                 item.coin, item.best_fast, item.best_slow, diff_pct), "INFO", Some("red"));
             signals.insert(item.symbol.clone(), "short".into());
-        } else if fast_cur > slow_cur && state.positions.contains_key(&item.symbol) {
-            // 已持多仓 + fast仍在slow上方 → 保持做多信号（不平仓）
-            signals.insert(item.symbol.clone(), "long".into());
-            log.log(&format!("  [信号] {} MA{}/{} 多头保持 | 差值: {:.4}%",
-                item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
-        } else if fast_cur < slow_cur && state.allow_short && state.positions.contains_key(&item.symbol) {
-            // 已持空仓 + fast仍在slow下方 → 保持做空信号（不平仓）
-            signals.insert(item.symbol.clone(), "short".into());
-            log.log(&format!("  [信号] {} MA{}/{} 空头保持 | 差值: {:.4}%",
-                item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
+        } else if fast_cur > slow_cur {
+            if let Some(pos) = state.positions.get(&item.symbol) {
+                if pos.side == "long" {
+                    // 持多仓 + fast仍在slow上方 → 保持做多信号
+                    signals.insert(item.symbol.clone(), "long".into());
+                    log.log(&format!("  [信号] {} MA{}/{} 多头保持 | 差值: {:.4}%",
+                        item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
+                }
+                // 持空仓 + fast在slow上方 → 不插入信号 → 触发"信号消失"平仓
+            }
+        } else if fast_cur < slow_cur {
+            if let Some(pos) = state.positions.get(&item.symbol) {
+                if pos.side == "short" && state.allow_short {
+                    // 持空仓 + fast仍在slow下方 → 保持做空信号
+                    signals.insert(item.symbol.clone(), "short".into());
+                    log.log(&format!("  [信号] {} MA{}/{} 空头保持 | 差值: {:.4}%",
+                        item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
+                }
+                // 持多仓 + fast在slow下方 → 不插入信号 → 触发"信号消失"平仓
+            }
         } else {
             log.log(&format!("  [信号] {} MA{}/{} 无叉 | 差值: {:.4}%",
                 item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
@@ -918,9 +948,10 @@ async fn check_stop_loss(
                     pnl_usd: pos.amount * state.leverage as f64 * pnl_pct / 100.0,
                     reason: format!("止损({:.1}%)", pnl_pct),
                 });
+                state.positions.remove(&sym);
+            } else {
+                log.log(&format!("[止损] {} 平仓失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));
             }
-
-            state.positions.remove(&sym);
         }
     }
 }
