@@ -65,6 +65,7 @@ struct StrategyConfig {
     allow_short: Option<bool>,
     stop_loss_pct: Option<f64>,
     loop_interval_secs: Option<u64>,
+    warmup_rounds: Option<u64>,
 }
 
 // ==================== 策略状态 ====================
@@ -85,6 +86,7 @@ struct StrategyState {
     allow_short: bool,
     stop_loss_pct: f64,
     loop_interval: u64,
+    warmup_rounds: u64,        // 热机轮数，前N轮只观察不交易
 
     // 运行状态
     run_count: u64,
@@ -138,7 +140,7 @@ impl StrategyState {
             top_n: None, top_coins: None, kline_limit: None, ma_params: None,
             min_signals: None, min_win_rate: None, min_profit_factor: None,
             max_mdd: None, position_ratio: None, leverage: None, fixed_capital: None,
-            allow_short: None, stop_loss_pct: None, loop_interval_secs: None,
+            allow_short: None, stop_loss_pct: None, loop_interval_secs: None, warmup_rounds: None,
         });
 
         let ma_str = c.ma_params.unwrap_or_else(|| "5_20,10_30,20_60,25_99".into());
@@ -165,6 +167,7 @@ impl StrategyState {
             allow_short: c.allow_short.unwrap_or(true),
             stop_loss_pct: c.stop_loss_pct.unwrap_or(5.0),
             loop_interval: c.loop_interval_secs.unwrap_or(60),
+            warmup_rounds: c.warmup_rounds.unwrap_or(3),
             run_count: 0,
             init_equity: 0.0,
             whitelist: vec![],
@@ -299,8 +302,8 @@ async fn main() {
     let mut state = StrategyState::new(config.strategy);
 
     log.log(&format!("MA参数: {:?}", state.ma_params), "INFO", None);
-    log.log(&format!("白名单: Top{} | 固定本金: {}U | 杠杆: {}x | 止损: {}%",
-        state.top_coins, state.fixed_capital, state.leverage, state.stop_loss_pct), "INFO", None);
+    log.log(&format!("白名单: Top{} | 固定本金: {}U | 杠杆: {}x | 止损: {}% | 热机: {}轮",
+        state.top_coins, state.fixed_capital, state.leverage, state.stop_loss_pct, state.warmup_rounds), "INFO", None);
 
     // 获取初始余额
     let bal = rest.get_usdt_balance().await;
@@ -372,15 +375,19 @@ async fn main() {
         // Step 3: 计算穿叉信号（每分钟）
         let signals = calc_signals(&rest, &log, &state).await;
 
-        // Step 4: 调仓
-        let ctrl_opening_stopped = web.controls.read().opening_stopped;
-        let ctrl_force_closing = web.controls.read().force_closing;
+        // Step 4: 调仓（热机期只观察不交易）
+        if state.run_count <= state.warmup_rounds {
+            log.log(&format!("[热机] 第 {}/{} 轮，只观察不交易", state.run_count, state.warmup_rounds), "INFO", Some("yellow"));
+        } else {
+            let ctrl_opening_stopped = web.controls.read().opening_stopped;
+            let ctrl_force_closing = web.controls.read().force_closing;
 
-        rebalance(&rest, &log, &mut state, &signals, equity,
-                  ctrl_opening_stopped, ctrl_force_closing).await;
+            rebalance(&rest, &log, &mut state, &signals, equity,
+                      ctrl_opening_stopped, ctrl_force_closing).await;
 
-        // Step 5: 检查止损
-        check_stop_loss(&rest, &log, &mut state).await;
+            // Step 5: 检查止损
+            check_stop_loss(&rest, &log, &mut state).await;
+        }
 
         // 更新 Web 面板
         update_web_dashboard(&web, &state, equity, ret_pct);
