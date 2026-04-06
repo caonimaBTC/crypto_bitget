@@ -615,6 +615,7 @@ async fn calc_signals(
         let cross_up = fast_prev <= slow_prev && fast_cur > slow_cur;
         let cross_down = fast_prev >= slow_prev && fast_cur < slow_cur;
 
+        // 穿叉信号：开新仓
         if cross_up {
             log.log(&format!("  [信号] {} 金叉 MA{}/{} | 差值: {:.4}%",
                 item.coin, item.best_fast, item.best_slow, diff_pct), "INFO", Some("green"));
@@ -623,6 +624,16 @@ async fn calc_signals(
             log.log(&format!("  [信号] {} 死叉 MA{}/{} | 差值: {:.4}%",
                 item.coin, item.best_fast, item.best_slow, diff_pct), "INFO", Some("red"));
             signals.insert(item.symbol.clone(), "short".into());
+        } else if fast_cur > slow_cur && state.positions.contains_key(&item.symbol) {
+            // 已持多仓 + fast仍在slow上方 → 保持做多信号（不平仓）
+            signals.insert(item.symbol.clone(), "long".into());
+            log.log(&format!("  [信号] {} MA{}/{} 多头保持 | 差值: {:.4}%",
+                item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
+        } else if fast_cur < slow_cur && state.allow_short && state.positions.contains_key(&item.symbol) {
+            // 已持空仓 + fast仍在slow下方 → 保持做空信号（不平仓）
+            signals.insert(item.symbol.clone(), "short".into());
+            log.log(&format!("  [信号] {} MA{}/{} 空头保持 | 差值: {:.4}%",
+                item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
         } else {
             log.log(&format!("  [信号] {} MA{}/{} 无叉 | 差值: {:.4}%",
                 item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
@@ -720,10 +731,10 @@ async fn rebalance(
                 pnl_usd,
                 reason: reason.into(),
             });
+            state.positions.remove(sym);
         } else {
             log.log(&format!("[平仓] {} 失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));
         }
-        state.positions.remove(sym);
     }
 
     // 需要开仓的：有信号但没持仓
@@ -734,11 +745,29 @@ async fn rebalance(
         return;
     }
 
+    // 查交易所真实持仓，防止重复开仓
+    let real_syms: Vec<String> = real_pos.iter()
+        .filter_map(|p| {
+            let amt = p.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if amt > 0.0 { p.get("symbol").and_then(|v| v.as_str()).map(|s| s.to_string()) } else { None }
+        })
+        .collect();
+
     let to_open: Vec<(&String, &String)> = signals.iter()
-        .filter(|(sym, _)| !state.positions.contains_key(*sym))
+        .filter(|(sym, _)| !state.positions.contains_key(*sym) && !real_syms.contains(sym))
         .collect();
 
     if to_open.is_empty() { return; }
+
+    // 检查余额是否够开仓
+    let available = {
+        let bal = rest.get_usdt_balance().await;
+        bal.get("Ok").and_then(|v| v.get("available_balance")).and_then(|v| v.as_f64()).unwrap_or(0.0)
+    };
+    if available < state.fixed_capital * 0.5 {
+        log.log(&format!("[调仓] 可用余额 {:.2}U 不足，跳过开仓", available), "WARN", Some("yellow"));
+        return;
+    }
 
     // 固定金额模式：500U 保证金 × 3倍杠杆 = 1500U 名义值
     // 按比例模式：权益 × 仓位系数 / 信号数
