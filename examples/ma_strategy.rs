@@ -944,21 +944,50 @@ fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64,
         })
     }).collect();
 
+    // 计算盈亏明细
+    let total_profit: f64 = state.trade_log.iter().filter(|t| t.pnl_usd > 0.0).map(|t| t.pnl_usd).sum();
+    let total_loss: f64 = state.trade_log.iter().filter(|t| t.pnl_usd <= 0.0).map(|t| t.pnl_usd).sum();
+
+    // 每个白名单币种的策略数据
+    let strategies: Vec<Value> = state.whitelist.iter().map(|w| {
+        let pos = state.positions.get(&w.symbol);
+        let coin_trades: Vec<&TradeRecord> = state.trade_log.iter().filter(|t| t.coin == w.coin).collect();
+        let coin_wins = coin_trades.iter().filter(|t| t.pnl_usd > 0.0).count();
+        let coin_pnl: f64 = coin_trades.iter().map(|t| t.pnl_usd).sum();
+        let coin_wr = if coin_trades.is_empty() { 0.0 } else { coin_wins as f64 / coin_trades.len() as f64 };
+
+        json!({
+            "name": w.coin,
+            "symbol": w.symbol,
+            "exchange": "Bitget",
+            "order_type": format!("MA{}/{}", w.best_fast, w.best_slow),
+            "position_side": pos.map(|p| if p.side == "long" { "Long" } else { "Short" }).unwrap_or(""),
+            "position_amount": pos.map(|p| p.amount * state.leverage as f64 / p.entry_price).unwrap_or(0.0),
+            "balance": equity,
+            "count": coin_trades.len(),
+            "win_rate": coin_wr,
+            "profit": coin_trades.iter().filter(|t| t.pnl_usd > 0.0).map(|t| t.pnl_usd).sum::<f64>(),
+            "loss": coin_trades.iter().filter(|t| t.pnl_usd <= 0.0).map(|t| t.pnl_usd).sum::<f64>(),
+            "total_profit": coin_pnl,
+        })
+    }).collect();
+
     web.update_stats(json!({
         "current_balance": equity,
         "initial_balance": state.init_equity,
         "available_balance": equity,
         "total_profit": total_pnl,
-        "win_rate": win_rate,
+        "total_loss": total_loss,
+        "win_rate": if total > 0 { wins as f64 / total as f64 } else { 0.0 },
         "count": total,
+        "success_count": wins,
+        "failure_count": total - wins,
         "return_pct": ret_pct,
         "server_name": "MA均线策略",
-        "strategies": state.whitelist.iter().map(|w| {
-            json!({"name": w.coin, "symbol": w.symbol, "exchange": "Bitget", "balance": equity})
-        }).collect::<Vec<_>>(),
+        "strategies": strategies,
     }));
 
-    web.update_positions(json!(pos_data));
+    // 持仓由轮询任务独立更新，这里不再重复推
     web.update_tables(vec![
         json!({"title": "白名单", "cols": ["币种","评分","胜率","盈亏比","MDD","MA"], "rows": wl_rows}),
         json!({"title": "交易记录", "cols": ["时间","币种","方向","入场","出场","盈亏%","盈亏$","原因"], "rows": trade_rows}),
