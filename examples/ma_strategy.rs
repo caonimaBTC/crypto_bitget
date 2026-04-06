@@ -883,24 +883,43 @@ fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64,
     let win_rate = if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 };
     let total_pnl: f64 = state.trade_log.iter().map(|t| t.pnl_usd).sum();
 
-    // 白名单表格
-    let wl_table: Vec<Value> = state.whitelist.iter().map(|w| {
-        json!({
-            "coin": w.coin, "score": format!("{:.1}", w.score),
-            "win_rate": format!("{:.1}%", w.win_rate * 100.0),
-            "pf": format!("{:.2}", w.profit_factor),
-            "mdd": format!("{:.2}%", w.max_dd),
-            "ma": format!("{}/{}", w.best_fast, w.best_slow),
-        })
+    // 白名单表格 — 行数据用数组格式，列名用 "cols"
+    let wl_rows: Vec<Value> = state.whitelist.iter().map(|w| {
+        json!([
+            w.coin,
+            format!("{:.1}", w.score),
+            format!("{:.1}%", w.win_rate * 100.0),
+            format!("{:.2}", w.profit_factor),
+            format!("{:.2}%", w.max_dd),
+            format!("{}/{}", w.best_fast, w.best_slow),
+        ])
     }).collect();
 
-    // 持仓表格
-    let pos_table: Vec<Value> = state.positions.values().map(|p| {
+    // 交易记录表格
+    let trade_rows: Vec<Value> = state.trade_log.iter().rev().take(50).map(|t| {
+        json!([
+            t.time,
+            t.coin,
+            t.side,
+            format!("{:.6}", t.entry),
+            format!("{:.6}", t.exit_price),
+            format!("{:+.2}%", t.pnl_pct),
+            format!("${:+.2}", t.pnl_usd),
+            t.reason,
+        ])
+    }).collect();
+
+    // 持仓数据 — 推送标准格式给前端
+    let pos_data: Vec<Value> = state.positions.values().map(|p| {
         json!({
-            "coin": p.coin,
-            "side": if p.side == "long" { "多" } else { "空" },
-            "entry": format!("{:.6}", p.entry_price),
-            "amount": format!("${:.2}", p.amount),
+            "symbol": p.symbol,
+            "side": if p.side == "long" { "Long" } else { "Short" },
+            "amount": p.amount / p.entry_price,  // 近似持仓量
+            "entry_price": p.entry_price,
+            "mark_price": p.entry_price,  // 没有实时标记价，用入场价
+            "unrealized_pnl": 0.0,
+            "leverage": state.leverage,
+            "margin_mode": "crossed",
         })
     }).collect();
 
@@ -918,8 +937,9 @@ fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64,
         }).collect::<Vec<_>>(),
     }));
 
-    web.update_positions(json!(pos_table));
+    web.update_positions(json!(pos_data));
     web.update_tables(vec![
-        json!({"title": "白名单", "columns": ["coin","score","win_rate","pf","mdd","ma"], "rows": wl_table}),
+        json!({"title": "白名单", "cols": ["币种","评分","胜率","盈亏比","MDD","MA"], "rows": wl_rows}),
+        json!({"title": "交易记录", "cols": ["时间","币种","方向","入场","出场","盈亏%","盈亏$","原因"], "rows": trade_rows}),
     ]);
 }
