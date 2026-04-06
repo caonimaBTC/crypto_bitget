@@ -244,10 +244,12 @@ impl BitgetRestClient {
                 "side": req.side.to_lowercase(),
                 "orderType": if is_market { "market" } else { "limit" },
                 "size": req.amount.to_string(),
-                "clientOid": req.cid.as_deref().unwrap_or(""),
                 "tradeSide": trade_side,
                 "force": force,
             });
+            if let Some(ref cid) = req.cid {
+                if !cid.is_empty() { body["clientOid"] = json!(cid); }
+            }
             // 限价单才带 price
             if !is_market {
                 if let Some(px) = req.price {
@@ -262,9 +264,11 @@ impl BitgetRestClient {
                 "side": req.side.to_lowercase(),
                 "orderType": if is_market { "market" } else { "limit" },
                 "size": req.amount.to_string(),
-                "clientOid": req.cid.as_deref().unwrap_or(""),
                 "force": force,
             });
+            if let Some(ref cid) = req.cid {
+                if !cid.is_empty() { body["clientOid"] = json!(cid); }
+            }
             if !is_market {
                 if let Some(px) = req.price {
                     body["price"] = json!(px.to_string());
@@ -415,10 +419,10 @@ impl BitgetRestClient {
                     "side": req.side.to_lowercase(),
                     "orderType": if is_market { "market" } else { "limit" },
                     "size": req.amount.to_string(),
-                    "clientOid": req.cid.as_deref().unwrap_or(""),
                     "tradeSide": trade_side,
                     "force": force,
                 });
+                if let Some(ref cid) = req.cid { if !cid.is_empty() { item["clientOid"] = json!(cid); } }
                 if !is_market { if let Some(px) = req.price { item["price"] = json!(px.to_string()); } }
                 item
             } else {
@@ -427,9 +431,9 @@ impl BitgetRestClient {
                     "side": req.side.to_lowercase(),
                     "orderType": if is_market { "market" } else { "limit" },
                     "size": req.amount.to_string(),
-                    "clientOid": req.cid.as_deref().unwrap_or(""),
                     "force": force,
                 });
+                if let Some(ref cid) = req.cid { if !cid.is_empty() { item["clientOid"] = json!(cid); } }
                 if !is_market { if let Some(px) = req.price { item["price"] = json!(px.to_string()); } }
                 item
             }
