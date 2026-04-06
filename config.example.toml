@@ -1,0 +1,18 @@
+# Bitget 交易所配置
+# 复制此文件为 config.toml 并填入你的 API 信息
+
+[exchange]
+name = "BitgetSwap"          # BitgetSwap (合约) | BitgetSpot (现货)
+key = "your_api_key"
+secret = "your_secret_key"
+passphrase = "your_passphrase"
+
+[web]
+host = "0.0.0.0"
+port = 8888
+username = "admin"
+password = "123456"
+
+[log]
+level = "INFO"               # TRACE | DEBUG | INFO | WARN | ERROR
+# file = "logs/crypto.log"   # 可选: 日志文件路径
