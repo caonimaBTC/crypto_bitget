@@ -335,16 +335,15 @@ async fn main() {
     // 启动时同步真实持仓
     sync_positions_from_exchange(&rest, &log, &mut state).await;
 
-    // 启动持仓轮询任务（每5秒更新持仓到Web面板）
+    // 启动持仓轮询任务（每秒更新持仓到Web面板）
     let web_poll = web.clone();
     tokio::spawn(async move {
         loop {
-            // 查真实持仓
             let pos_result = rest2.get_positions().await;
             if let Some(positions) = pos_result.get("Ok").and_then(|v| v.as_array()) {
                 web_poll.update_positions(json!(positions));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
 
