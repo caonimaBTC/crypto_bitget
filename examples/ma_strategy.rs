@@ -260,9 +260,9 @@ fn save_trade_csv(record: &TradeRecord) {
         if need_header {
             let _ = writeln!(f, "time,coin,side,entry,exit,pnl_pct,pnl_usd,reason");
         }
-        let _ = writeln!(f, "{},{},{},{:.6},{:.6},{:.2},{:.2},{}",
+        let _ = writeln!(f, "{},{},{},{:.6},{:.6},{:.2},{:.2},\"{}\"",
             record.time, record.coin, record.side, record.entry, record.exit_price,
-            record.pnl_pct, record.pnl_usd, record.reason);
+            record.pnl_pct, record.pnl_usd, record.reason.replace('"', ""));
     }
 }
 
@@ -364,9 +364,7 @@ async fn main() {
 
     // 共享数据（持仓轮询线程写，主循环读）
     let shared_upnl = Arc::new(parking_lot::RwLock::new(0.0f64));
-    let shared_equity = Arc::new(parking_lot::RwLock::new(0.0f64));
     let shared_upnl_w = shared_upnl.clone();
-    let shared_equity_w = shared_equity.clone();
 
     // 启动持仓+余额轮询任务（每秒更新到Web面板）
     let web_poll = web.clone();
@@ -382,19 +380,8 @@ async fn main() {
                 *shared_upnl_w.write() = upnl;
                 web_poll.update_positions(json!(positions));
             }
-            // 查余额（accountEquity = 权益）
-            let bal = rest2.get_usdt_balance().await;
-            if let Some(ok) = bal.get("Ok") {
-                let eq = ok.get("balance").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                *shared_equity_w.write() = eq;
-                // 实时更新顶部余额
-                let upnl = *shared_upnl_w.read();
-                let roi = if init_eq > 0.0 { (eq - init_eq) / init_eq * 100.0 } else { 0.0 };
-                web_poll.update_stats(json!({
-                    "current_balance": eq,
-                    "unrealized_pnl": upnl,
-                }));
-            }
+            // 余额由主循环每60秒查询，这里不重复查
+            // 只负责持仓和未实现盈亏的秒级更新
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
@@ -791,11 +778,13 @@ async fn rebalance(
 
         let mut pnl_pct = (exit_price - pos.entry_price) / pos.entry_price * 100.0;
         if pos.side == "short" { pnl_pct = -pnl_pct; }
-        let pnl_usd = pos.amount * state.leverage as f64 * pnl_pct / 100.0;
+        let notional = pos.amount * state.leverage as f64;
+        let fee = notional * 0.0006;  // taker手续费
+        let pnl_usd = notional * pnl_pct / 100.0 - fee;
 
         if result.get("Ok").is_some() {
-            log.log(&format!("[平仓] {} 平{} | {:.2}% ${:.2} | {}",
-                pos.coin, direction, pnl_pct, pnl_usd, reason), "INFO", Some("yellow"));
+            log.log(&format!("[平仓] {} 平{} | {:.2}% ${:.2} | 手续费: ${:.2} | {}",
+                pos.coin, direction, pnl_pct, pnl_usd, fee, reason), "INFO", Some("yellow"));
 
             let record = TradeRecord {
                 time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
@@ -1001,8 +990,11 @@ async fn check_stop_loss(
             let direction = if pos.side == "long" { "多" } else { "空" };
 
             if result.get("Ok").is_some() {
-                log.log(&format!("[止损] {} 平{} | 亏损: {:.2}% | 入场: {:.6} | 现价: {:.6}",
-                    pos.coin, direction, pnl_pct, pos.entry_price, price), "WARN", Some("red"));
+                let sl_notional = pos.amount * state.leverage as f64;
+                let sl_fee = sl_notional * 0.0006;
+                let sl_pnl = sl_notional * pnl_pct / 100.0 - sl_fee;
+                log.log(&format!("[止损] {} 平{} | 亏损: {:.2}% ${:.2} | 手续费: ${:.2} | 入场: {} | 现价: {}",
+                    pos.coin, direction, pnl_pct, sl_pnl, sl_fee, pos.entry_price, price), "WARN", Some("red"));
 
                 let record = TradeRecord {
                     time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
@@ -1011,7 +1003,7 @@ async fn check_stop_loss(
                     entry: pos.entry_price,
                     exit_price: price,
                     pnl_pct,
-                    pnl_usd: pos.amount * state.leverage as f64 * pnl_pct / 100.0,
+                    pnl_usd: sl_pnl,
                     reason: format!("止损({:.1}%)", pnl_pct),
                 };
                 save_trade_csv(&record);
