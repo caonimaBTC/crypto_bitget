@@ -335,12 +335,21 @@ async fn main() {
     // 启动时同步真实持仓
     sync_positions_from_exchange(&rest, &log, &mut state).await;
 
+    // 共享未实现盈亏（持仓轮询线程写，主循环读）
+    let shared_upnl = Arc::new(parking_lot::RwLock::new(0.0f64));
+    let shared_upnl_w = shared_upnl.clone();
+
     // 启动持仓轮询任务（每秒更新持仓到Web面板）
     let web_poll = web.clone();
     tokio::spawn(async move {
         loop {
             let pos_result = rest2.get_positions().await;
             if let Some(positions) = pos_result.get("Ok").and_then(|v| v.as_array()) {
+                // 计算未实现盈亏总和
+                let upnl: f64 = positions.iter()
+                    .map(|p| p.get("unrealized_pnl").and_then(|v| v.as_f64()).unwrap_or(0.0))
+                    .sum();
+                *shared_upnl_w.write() = upnl;
                 web_poll.update_positions(json!(positions));
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -411,7 +420,8 @@ async fn main() {
         }
 
         // 更新 Web 面板
-        update_web_dashboard(&web, &state, equity, ret_pct);
+        let upnl = *shared_upnl.read();
+        update_web_dashboard(&web, &state, equity, ret_pct, upnl);
 
         // 等待下一轮
         tokio::time::sleep(std::time::Duration::from_secs(state.loop_interval)).await;
@@ -468,22 +478,12 @@ async fn sync_positions_from_exchange(
 // ==================== 获取总权益 ====================
 
 async fn get_total_equity(rest: &BitgetRestClient) -> f64 {
+    // accountEquity 已经包含了未实现盈亏，直接用
     let bal = rest.get_usdt_balance().await;
-    let balance = bal.get("Ok")
+    bal.get("Ok")
         .and_then(|v| v.get("balance"))
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    // 加上未实现盈亏
-    let pos = rest.get_positions().await;
-    let unrealized: f64 = pos.get("Ok")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter()
-            .map(|p| p.get("unrealized_pnl").and_then(|v| v.as_f64()).unwrap_or(0.0))
-            .sum())
-        .unwrap_or(0.0);
-
-    balance + unrealized
+        .unwrap_or(0.0)
 }
 
 // ==================== Step 1: 获取 Top N 标的 ====================
@@ -958,7 +958,7 @@ async fn check_stop_loss(
 
 // ==================== 面板更新 ====================
 
-fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64, ret_pct: f64) {
+fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64, ret_pct: f64, unrealized_pnl: f64) {
     let wins = state.trade_log.iter().filter(|t| t.pnl_usd > 0.0).count();
     let total = state.trade_log.len();
     let win_rate = if total > 0 { wins as f64 / total as f64 * 100.0 } else { 0.0 };
@@ -1032,12 +1032,27 @@ fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64,
         })
     }).collect();
 
+    // unrealized_pnl 从持仓轮询线程获取（参数传入）
+
+    // 计算当日盈亏
+    let today_str = chrono::Local::now().format("%m-%d").to_string();
+    let today_trades: Vec<&TradeRecord> = state.trade_log.iter()
+        .filter(|t| t.time.starts_with(&today_str)).collect();
+    let today_profit: f64 = today_trades.iter().map(|t| t.pnl_usd).sum();
+    let today_wins = today_trades.iter().filter(|t| t.pnl_usd > 0.0).count();
+    let today_wr = if today_trades.is_empty() { 0.0 } else { today_wins as f64 / today_trades.len() as f64 };
+
     web.update_stats(json!({
         "current_balance": equity,
         "initial_balance": state.init_equity,
         "available_balance": equity,
         "total_profit": total_pnl,
         "total_loss": total_loss,
+        "unrealized_pnl": unrealized_pnl,
+        "today_profit": today_profit,
+        "frozen_balance": 0,
+        "funding_fee": 0,
+        "volume": 0,
         "win_rate": if total > 0 { wins as f64 / total as f64 } else { 0.0 },
         "count": total,
         "success_count": wins,
@@ -1045,6 +1060,15 @@ fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64,
         "return_pct": ret_pct,
         "server_name": "MA均线策略",
         "strategies": strategies,
+        "today": {
+            "count": today_trades.len(),
+            "success_count": today_wins,
+            "failure_count": today_trades.len() - today_wins,
+            "win_rate": today_wr,
+            "profit": today_trades.iter().filter(|t| t.pnl_usd > 0.0).map(|t| t.pnl_usd).sum::<f64>(),
+            "loss": today_trades.iter().filter(|t| t.pnl_usd <= 0.0).map(|t| t.pnl_usd).sum::<f64>(),
+            "total_profit": today_profit,
+        },
     }));
 
     // 持仓由轮询任务独立更新，这里不再重复推
