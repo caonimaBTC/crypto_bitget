@@ -68,7 +68,7 @@ const JS_UTILS: &str = r#"
 let ws,flt='ALL',asc=true;
 function $(id){return document.getElementById(id)}
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-function f(v,d){d=d||2;return v==null?'0.00':Number(v).toFixed(d)}
+function f(v,d){if(v==null)return'0.00';v=Number(v);if(d!==undefined)return v.toFixed(d);if(Math.abs(v)<0.001)return v.toFixed(6);if(Math.abs(v)<1)return v.toFixed(4);if(Math.abs(v)<100)return v.toFixed(2);return v.toFixed(2)}
 function fc(v){v=Number(v);return v>0?'green':v<0?'red':''}
 function getCookie(n){const v=document.cookie.match('(^|;)\\s*'+n+'=([^;]*)');return v?v[2]:null}
 function sv(id,t){const e=$(id);if(e)e.textContent=t}
@@ -283,7 +283,7 @@ function upPos(pos){{
 const b=$('pos-body');if(!b)return;
 if(!pos||!Array.isArray(pos)||pos.length===0){{b.innerHTML='<tr><td colspan="10" class="grey" style="text-align:center;padding:16px">暂无持仓</td></tr>';return}}
 b.innerHTML='';pos.forEach((p,i)=>{{const s=p.side||'';const sc=s==='Long'?'green':'red';const pnl=Number(p.unrealized_pnl||0);const pc=fc(pnl);const e=Number(p.entry_price||0);const m=Number(p.mark_price||0);const vs=e>0?((m-e)/e*100).toFixed(2)+'%':'';const a=Number(p.amount||0);
-const tr=document.createElement('tr');tr.innerHTML='<td>'+(i+1)+'</td><td><b>'+esc(p.symbol)+'</b></td><td class="'+sc+'"><b>'+s+'</b></td><td>'+f(a,4)+' ($'+f(a*m,0)+')</td><td>'+f(e,1)+'</td><td>'+f(m,1)+' <span class="'+pc+'">'+vs+'</span></td><td>'+(p.liquidation_price?f(p.liquidation_price,1):'-')+'</td><td class="'+pc+'"><b>'+f(pnl)+'</b></td><td>'+(p.margin_mode||'cross')+'</td><td>'+(p.leverage||'-')+'x</td>';
+const tr=document.createElement('tr');tr.innerHTML='<td>'+(i+1)+'</td><td><b>'+esc(p.symbol)+'</b></td><td class="'+sc+'"><b>'+s+'</b></td><td>'+f(a,4)+' ($'+f(a*m)+')</td><td>'+f(e)+'</td><td>'+f(m)+' <span class="'+pc+'">'+vs+'</span></td><td>'+(p.liquidation_price?f(p.liquidation_price):'-')+'</td><td class="'+pc+'"><b>'+f(pnl)+'</b></td><td>'+(p.margin_mode||'cross')+'</td><td>'+(p.leverage||'-')+'x</td>';
 b.appendChild(tr)}});
 }}
 

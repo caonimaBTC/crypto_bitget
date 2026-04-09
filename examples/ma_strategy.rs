@@ -252,6 +252,33 @@ fn backtest_ma(closes: &[f64], fast: usize, slow: usize, fee: f64) -> Option<(f6
     Some((win_rate, pf, max_dd, trades.len(), total_return))
 }
 
+fn save_trade_csv(record: &TradeRecord) {
+    use std::io::Write;
+    let path = "trades.csv";
+    let need_header = !std::path::Path::new(path).exists();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if need_header {
+            let _ = writeln!(f, "time,coin,side,entry,exit,pnl_pct,pnl_usd,reason");
+        }
+        let _ = writeln!(f, "{},{},{},{:.6},{:.6},{:.2},{:.2},{}",
+            record.time, record.coin, record.side, record.entry, record.exit_price,
+            record.pnl_pct, record.pnl_usd, record.reason);
+    }
+}
+
+fn save_equity_csv(equity: f64, upnl: f64) {
+    use std::io::Write;
+    let path = "equity.csv";
+    let need_header = !std::path::Path::new(path).exists();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if need_header {
+            let _ = writeln!(f, "time,equity,unrealized_pnl");
+        }
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(f, "{},{:.2},{:.2}", now, equity, upnl);
+    }
+}
+
 fn calc_score(win_rate: f64, pf: f64, max_dd: f64, max_mdd: f64) -> f64 {
     (win_rate * 100.0).min(100.0) * 0.30
         + (pf * 20.0).min(60.0) * 0.30
@@ -270,7 +297,7 @@ async fn main() {
 
     // 初始化日志
     let log_level = config.log.as_ref().and_then(|l| l.level.clone()).unwrap_or("INFO".into());
-    let log = Logger::new(&log_level, None);
+    let log = Logger::new(&log_level, Some("strategy.log"));
 
     // 启动 Web 面板
     let web_cfg = config.web.unwrap_or(WebConfig {
@@ -335,22 +362,38 @@ async fn main() {
     // 启动时同步真实持仓
     sync_positions_from_exchange(&rest, &log, &mut state).await;
 
-    // 共享未实现盈亏（持仓轮询线程写，主循环读）
+    // 共享数据（持仓轮询线程写，主循环读）
     let shared_upnl = Arc::new(parking_lot::RwLock::new(0.0f64));
+    let shared_equity = Arc::new(parking_lot::RwLock::new(0.0f64));
     let shared_upnl_w = shared_upnl.clone();
+    let shared_equity_w = shared_equity.clone();
 
-    // 启动持仓轮询任务（每秒更新持仓到Web面板）
+    // 启动持仓+余额轮询任务（每秒更新到Web面板）
     let web_poll = web.clone();
+    let init_eq = state.init_equity;
     tokio::spawn(async move {
         loop {
+            // 查持仓
             let pos_result = rest2.get_positions().await;
             if let Some(positions) = pos_result.get("Ok").and_then(|v| v.as_array()) {
-                // 计算未实现盈亏总和
                 let upnl: f64 = positions.iter()
                     .map(|p| p.get("unrealized_pnl").and_then(|v| v.as_f64()).unwrap_or(0.0))
                     .sum();
                 *shared_upnl_w.write() = upnl;
                 web_poll.update_positions(json!(positions));
+            }
+            // 查余额（accountEquity = 权益）
+            let bal = rest2.get_usdt_balance().await;
+            if let Some(ok) = bal.get("Ok") {
+                let eq = ok.get("balance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                *shared_equity_w.write() = eq;
+                // 实时更新顶部余额
+                let upnl = *shared_upnl_w.read();
+                let roi = if init_eq > 0.0 { (eq - init_eq) / init_eq * 100.0 } else { 0.0 };
+                web_poll.update_stats(json!({
+                    "current_balance": eq,
+                    "unrealized_pnl": upnl,
+                }));
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
@@ -422,6 +465,9 @@ async fn main() {
         // 更新 Web 面板
         let upnl = *shared_upnl.read();
         update_web_dashboard(&web, &state, equity, ret_pct, upnl);
+
+        // 每分钟保存权益曲线到CSV
+        save_equity_csv(equity, upnl);
 
         // 等待下一轮
         tokio::time::sleep(std::time::Duration::from_secs(state.loop_interval)).await;
@@ -751,7 +797,7 @@ async fn rebalance(
             log.log(&format!("[平仓] {} 平{} | {:.2}% ${:.2} | {}",
                 pos.coin, direction, pnl_pct, pnl_usd, reason), "INFO", Some("yellow"));
 
-            state.trade_log.push(TradeRecord {
+            let record = TradeRecord {
                 time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
                 coin: pos.coin.clone(),
                 side: direction.into(),
@@ -760,7 +806,9 @@ async fn rebalance(
                 pnl_pct,
                 pnl_usd,
                 reason: reason.into(),
-            });
+            };
+            save_trade_csv(&record);
+            state.trade_log.push(record);
             state.positions.remove(sym);
         } else {
             log.log(&format!("[平仓] {} 失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));
@@ -867,8 +915,12 @@ async fn rebalance(
 
         let result = rest.place_order(&order).await;
         if result.get("Ok").is_some() {
-            log.log(&format!("[开{}] {} | 价: {:.6} | 量: {:.6} | 额: ${:.2}",
-                direction, coin, price, qty, single_amt), "INFO", Some("green"));
+            // 手续费估算: 名义值 × taker费率
+            let fee_est = notional * 0.0006;
+            log.log(&format!("[开{}] {} | 价: {} | 量: {:.4} | 保证金: ${:.0} | 名义值: ${:.0} | 手续费: ~${:.2}",
+                direction, coin, price, qty, single_amt, notional, fee_est), "INFO", Some("green"));
+
+            let coin_clone = coin.clone();
 
             // 找到白名单中对应的 MA 参数
             let (bf, bs) = state.whitelist.iter()
@@ -887,6 +939,20 @@ async fn rebalance(
                 best_fast: bf,
                 best_slow: bs,
             });
+
+            // 记录开仓到交易日志
+            let record = TradeRecord {
+                time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
+                coin: coin_clone,
+                side: direction.into(),
+                entry: price,
+                exit_price: 0.0,
+                pnl_pct: 0.0,
+                pnl_usd: -fee_est,
+                reason: format!("开仓 ${:.0}x{}", single_amt, state.leverage),
+            };
+            save_trade_csv(&record);
+            state.trade_log.push(record);
         } else {
             log.log(&format!("[开仓] {} 失败: {:?}", sym, result.get("Err")), "ERROR", Some("red"));
         }
@@ -938,7 +1004,7 @@ async fn check_stop_loss(
                 log.log(&format!("[止损] {} 平{} | 亏损: {:.2}% | 入场: {:.6} | 现价: {:.6}",
                     pos.coin, direction, pnl_pct, pos.entry_price, price), "WARN", Some("red"));
 
-                state.trade_log.push(TradeRecord {
+                let record = TradeRecord {
                     time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
                     coin: pos.coin.clone(),
                     side: direction.into(),
@@ -947,7 +1013,9 @@ async fn check_stop_loss(
                     pnl_pct,
                     pnl_usd: pos.amount * state.leverage as f64 * pnl_pct / 100.0,
                     reason: format!("止损({:.1}%)", pnl_pct),
-                });
+                };
+                save_trade_csv(&record);
+                state.trade_log.push(record);
                 state.positions.remove(&sym);
             } else {
                 log.log(&format!("[止损] {} 平仓失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));

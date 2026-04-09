@@ -198,6 +198,7 @@ impl BitgetRestClient {
                         "entry_price": pf(p, "openPriceAvg"),
                         "mark_price": pf(p, "markPrice"),
                         "unrealized_pnl": pf(p, "unrealizedPL"),
+                        "liquidation_price": pf(p, "liquidationPrice"),
                         "leverage": pf(p, "leverage"),
                         "margin_mode": ps(p, "marginMode"),
                     }));
