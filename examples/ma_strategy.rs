@@ -95,6 +95,7 @@ struct StrategyState {
     positions: HashMap<String, PositionInfo>,   // symbol -> info
     instruments: HashMap<String, Value>,        // symbol -> instrument info
     trade_log: Vec<TradeRecord>,
+    total_fees: f64,                              // 累计手续费
 }
 
 #[derive(Clone)]
@@ -174,6 +175,7 @@ impl StrategyState {
             positions: HashMap::new(),
             instruments: HashMap::new(),
             trade_log: vec![],
+            total_fees: 0.0,
         }
     }
 }
@@ -783,6 +785,7 @@ async fn rebalance(
         let pnl_usd = notional * pnl_pct / 100.0 - fee;
 
         if result.get("Ok").is_some() {
+            state.total_fees += fee;
             log.log(&format!("[平仓] {} 平{} | {:.2}% ${:.2} | 手续费: ${:.2} | {}",
                 pos.coin, direction, pnl_pct, pnl_usd, fee, reason), "INFO", Some("yellow"));
 
@@ -929,19 +932,8 @@ async fn rebalance(
                 best_slow: bs,
             });
 
-            // 记录开仓到交易日志
-            let record = TradeRecord {
-                time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
-                coin: coin_clone,
-                side: direction.into(),
-                entry: price,
-                exit_price: 0.0,
-                pnl_pct: 0.0,
-                pnl_usd: -fee_est,
-                reason: format!("开仓 ${:.0}x{}", single_amt, state.leverage),
-            };
-            save_trade_csv(&record);
-            state.trade_log.push(record);
+            // 手续费累计（不进trade_log，trade_log只记平仓结果）
+            state.total_fees += fee_est;
         } else {
             log.log(&format!("[开仓] {} 失败: {:?}", sym, result.get("Err")), "ERROR", Some("red"));
         }
@@ -1008,6 +1000,7 @@ async fn check_stop_loss(
                 };
                 save_trade_csv(&record);
                 state.trade_log.push(record);
+                state.total_fees += sl_fee;
                 state.positions.remove(&sym);
             } else {
                 log.log(&format!("[止损] {} 平仓失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));
@@ -1111,7 +1104,7 @@ fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64,
         "unrealized_pnl": unrealized_pnl,
         "today_profit": today_profit,
         "frozen_balance": 0,
-        "funding_fee": 0,
+        "funding_fee": state.total_fees,
         "volume": 0,
         "win_rate": if total > 0 { wins as f64 / total as f64 } else { 0.0 },
         "count": total,
