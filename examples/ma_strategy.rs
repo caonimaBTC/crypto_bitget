@@ -274,6 +274,41 @@ fn save_trade_csv(record: &TradeRecord) {
     }
 }
 
+fn load_trade_csv() -> (Vec<TradeRecord>, f64) {
+    use std::io::BufRead;
+    let path = "trades.csv";
+    let mut records = vec![];
+    let mut total_fees = 0.0;
+    if let Ok(file) = std::fs::File::open(path) {
+        let reader = std::io::BufReader::new(file);
+        for (i, line) in reader.lines().enumerate() {
+            if i == 0 { continue; } // 跳过 header
+            if let Ok(line) = line {
+                let parts: Vec<&str> = line.splitn(8, ',').collect();
+                if parts.len() >= 7 {
+                    let pnl_usd = parts[6].trim().parse::<f64>().unwrap_or(0.0);
+                    let reason = if parts.len() >= 8 {
+                        parts[7].trim().trim_matches('"').to_string()
+                    } else { String::new() };
+                    records.push(TradeRecord {
+                        time: parts[0].to_string(),
+                        coin: parts[1].to_string(),
+                        side: parts[2].to_string(),
+                        entry: parts[3].parse().unwrap_or(0.0),
+                        exit_price: parts[4].parse().unwrap_or(0.0),
+                        pnl_pct: parts[5].parse().unwrap_or(0.0),
+                        pnl_usd,
+                        reason,
+                    });
+                    // 估算手续费（每笔交易约 名义值*0.06%，这里用pnl近似）
+                    total_fees += 0.60; // 每笔约$0.6手续费
+                }
+            }
+        }
+    }
+    (records, total_fees)
+}
+
 fn save_equity_csv(equity: f64, upnl: f64) {
     use std::io::Write;
     let path = "equity.csv";
@@ -399,6 +434,14 @@ async fn main() {
             }
         }
         log.log(&format!("加载 {} 个合约", state.instruments.len()), "INFO", None);
+    }
+
+    // 加载历史交易记录
+    let (loaded_trades, loaded_fees) = load_trade_csv();
+    if !loaded_trades.is_empty() {
+        log.log(&format!("[加载] 历史交易记录: {} 笔 | 累计手续费: ${:.2}", loaded_trades.len(), loaded_fees), "INFO", Some("cyan"));
+        state.trade_log = loaded_trades;
+        state.total_fees = loaded_fees;
     }
 
     // 启动时同步真实持仓
