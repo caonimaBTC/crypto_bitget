@@ -201,7 +201,7 @@ pub fn detail_html(name: &str) -> String {
 <div class="info-box"><div class="lbl">初始余额</div><div class="val" id="v-init">0</div></div>
 <div class="info-box"><div class="lbl">总收益率</div><div class="val" id="v-roi">0%</div></div>
 <div class="info-box"><div class="lbl">今日利润</div><div class="val" id="v-tp">0</div></div>
-<div class="info-box"><div class="lbl">资金费</div><div class="val" id="v-fund">0</div></div>
+<div class="info-box"><div class="lbl">累计手续费</div><div class="val red" id="v-fund">0</div></div>
 </div></div></div>
 
 <!-- 持仓 -->
