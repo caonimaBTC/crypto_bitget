@@ -331,9 +331,9 @@ fn load_equity_csv() -> Vec<(String, f64, f64)> {
             }
         }
     }
-    // 只保留最近500条
-    if records.len() > 500 {
-        records = records[records.len()-500..].to_vec();
+    // 只保留最近10080条（7天）
+    if records.len() > 10080 {
+        records = records[records.len()-10080..].to_vec();
     }
     records
 }
@@ -579,9 +579,9 @@ async fn main() {
 
         // 每分钟保存权益曲线到CSV + 内存
         save_equity_csv(equity, upnl);
-        let time_label = chrono::Local::now().format("%H:%M").to_string();
+        let time_label = chrono::Local::now().format("%m-%d %H:%M").to_string();
         state.equity_history.push((time_label, equity, upnl));
-        if state.equity_history.len() > 500 {
+        if state.equity_history.len() > 10080 {
             state.equity_history.remove(0);
         }
 

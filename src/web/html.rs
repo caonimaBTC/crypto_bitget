@@ -277,7 +277,7 @@ sv('r2c',s.count||0);sv('r2w',s.success_count||0);sv('r2l',s.failure_count||0);s
 if(s.today){{sv('r1c',s.today.count||0);sv('r1w',s.today.success_count||0);sv('r1l',s.today.failure_count||0);sv('r1r',((s.today.win_rate||0)*100).toFixed(1)+'%');sv('r1p',f(s.today.profit||0));sv('r1s',f(s.today.loss||0));sv('r1t',f(s.today.total_profit||0))}}
 // chart — 首次加载历史数据
 if(s.equity_history&&s.equity_history.length>0&&pnlD.length===0){{pnlD=s.equity_history;upChart()}}
-if(s.current_balance>0){{const now=new Date();const lb=now.getHours()+':'+String(now.getMinutes()).padStart(2,'0');if(pnlD.length===0||pnlD[pnlD.length-1].l!==lb){{pnlD.push({{l:lb,p:Number(s.total_profit||0),b:Number(s.current_balance)}});if(pnlD.length>500)pnlD.shift();upChart()}}}}
+if(s.current_balance>0){{const now=new Date();const lb=now.getHours()+':'+String(now.getMinutes()).padStart(2,'0');if(pnlD.length===0||pnlD[pnlD.length-1].l!==lb){{pnlD.push({{l:lb,p:Number(s.total_profit||0),b:Number(s.current_balance)}});if(pnlD.length>10080)pnlD.shift();upChart()}}}}
 }}
 
 function upPos(pos){{
