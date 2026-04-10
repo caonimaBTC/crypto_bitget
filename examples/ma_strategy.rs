@@ -88,7 +88,8 @@ struct StrategyState {
     stop_loss_pct: f64,
     loop_interval: u64,
     warmup_rounds: u64,
-    blacklist: Vec<String>,    // 黑名单币种
+    blacklist: Vec<String>,              // 配置文件永久黑名单
+    auto_blacklist: HashMap<String, u64>, // 动态黑名单 {coin: 过期时间戳ms}
 
     // 运行状态
     run_count: u64,
@@ -173,6 +174,7 @@ impl StrategyState {
             warmup_rounds: c.warmup_rounds.unwrap_or(3),
             blacklist: c.blacklist.unwrap_or_default()
                 .split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect(),
+            auto_blacklist: HashMap::new(),
             run_count: 0,
             init_equity: 0.0,
             whitelist: vec![],
@@ -282,6 +284,37 @@ fn save_equity_csv(equity: f64, upnl: f64) {
         }
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let _ = writeln!(f, "{},{:.2},{:.2}", now, equity, upnl);
+    }
+}
+
+fn check_auto_blacklist(state: &mut StrategyState, coin: &str, log: &Logger) {
+    let now = timestamp_ms();
+    let h24 = 24 * 3600 * 1000;
+
+    // 统计该币24小时内的亏损次数
+    let today_str = chrono::Local::now().format("%m-%d").to_string();
+    let yesterday_str = (chrono::Local::now() - chrono::Duration::hours(24)).format("%m-%d").to_string();
+    let losses_24h = state.trade_log.iter()
+        .filter(|t| t.coin == coin && t.pnl_usd <= 0.0
+            && (t.time.starts_with(&today_str) || t.time.starts_with(&yesterday_str)))
+        .count();
+
+    if losses_24h >= 2 {
+        let expire = now + h24;
+        state.auto_blacklist.insert(coin.to_string(), expire);
+        log.log(&format!("[黑名单] {} 24h内亏损{}次，自动拉黑24小时", coin, losses_24h), "WARN", Some("red"));
+    }
+}
+
+fn cleanup_auto_blacklist(state: &mut StrategyState, log: &Logger) {
+    let now = timestamp_ms();
+    let expired: Vec<String> = state.auto_blacklist.iter()
+        .filter(|(_, &expire)| now >= expire)
+        .map(|(coin, _)| coin.clone())
+        .collect();
+    for coin in expired {
+        state.auto_blacklist.remove(&coin);
+        log.log(&format!("[黑名单] {} 冷却到期，已解除", coin), "INFO", Some("green"));
     }
 }
 
@@ -428,7 +461,10 @@ async fn main() {
             state.run_count, equity, ret_pct, state.whitelist.len(), state.positions.len()), "INFO", None);
 
         // Step 1: 获取 Top40 标的（每分钟）
-        let top_symbols = get_top_symbols(&rest, state.top_n, &state.blacklist).await;
+        // 清理过期的动态黑名单
+        cleanup_auto_blacklist(&mut state, &log);
+
+        let top_symbols = get_top_symbols(&rest, state.top_n, &state.blacklist, &state.auto_blacklist).await;
         if top_symbols.is_empty() {
             log.log("标的池为空，跳过", "WARN", Some("yellow"));
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -530,7 +566,7 @@ async fn get_total_equity(rest: &BitgetRestClient) -> f64 {
 
 // ==================== Step 1: 获取 Top N 标的 ====================
 
-async fn get_top_symbols(rest: &BitgetRestClient, top_n: usize, blacklist: &[String]) -> Vec<(String, f64)> {
+async fn get_top_symbols(rest: &BitgetRestClient, top_n: usize, blacklist: &[String], auto_blacklist: &HashMap<String, u64>) -> Vec<(String, f64)> {
     let result = rest.get_all_tickers().await;
     let tickers = match result.get("Ok").and_then(|v| v.as_array()) {
         Some(arr) => arr,
@@ -541,9 +577,10 @@ async fn get_top_symbols(rest: &BitgetRestClient, top_n: usize, blacklist: &[Str
         .filter_map(|t| {
             let sym = t.get("symbol")?.as_str()?;
             if !sym.ends_with("USDT") { return None; }
-            // 黑名单过滤
+            // 黑名单过滤（永久 + 动态）
             let coin = sym.replace("_USDT", "");
             if blacklist.iter().any(|b| b == &coin) { return None; }
+            if auto_blacklist.contains_key(&coin) { return None; }
             let qv = t.get("quote_volume")?.as_f64().unwrap_or(0.0);
             if qv > 0.0 { Some((sym.to_string(), qv)) } else { None }
         })
@@ -810,8 +847,13 @@ async fn rebalance(
                 reason: reason.into(),
             };
             save_trade_csv(&record);
+            let coin_name = record.coin.clone();
             state.trade_log.push(record);
             state.positions.remove(sym);
+            // 亏损时检查是否需要自动拉黑
+            if pnl_usd <= 0.0 {
+                check_auto_blacklist(state, &coin_name, log);
+            }
         } else {
             log.log(&format!("[平仓] {} 失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));
         }
@@ -1009,9 +1051,11 @@ async fn check_stop_loss(
                     reason: format!("止损({:.1}%)", pnl_pct),
                 };
                 save_trade_csv(&record);
+                let coin_name = record.coin.clone();
                 state.trade_log.push(record);
                 state.total_fees += sl_fee;
                 state.positions.remove(&sym);
+                check_auto_blacklist(state, &coin_name, log);
             } else {
                 log.log(&format!("[止损] {} 平仓失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));
             }
