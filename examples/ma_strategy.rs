@@ -98,7 +98,8 @@ struct StrategyState {
     positions: HashMap<String, PositionInfo>,   // symbol -> info
     instruments: HashMap<String, Value>,        // symbol -> instrument info
     trade_log: Vec<TradeRecord>,
-    total_fees: f64,                              // 累计手续费
+    total_fees: f64,
+    equity_history: Vec<(String, f64, f64)>,       // [(time, equity, upnl)]
 }
 
 #[derive(Clone)]
@@ -182,6 +183,7 @@ impl StrategyState {
             instruments: HashMap::new(),
             trade_log: vec![],
             total_fees: 0.0,
+            equity_history: vec![],
         }
     }
 }
@@ -307,6 +309,33 @@ fn load_trade_csv() -> (Vec<TradeRecord>, f64) {
         }
     }
     (records, total_fees)
+}
+
+fn load_equity_csv() -> Vec<(String, f64, f64)> {
+    // 返回 [(time, equity, upnl), ...]
+    use std::io::BufRead;
+    let path = "equity.csv";
+    let mut records = vec![];
+    if let Ok(file) = std::fs::File::open(path) {
+        let reader = std::io::BufReader::new(file);
+        for (i, line) in reader.lines().enumerate() {
+            if i == 0 { continue; }
+            if let Ok(line) = line {
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 3 {
+                    let time = parts[0].to_string();
+                    let eq = parts[1].parse::<f64>().unwrap_or(0.0);
+                    let upnl = parts[2].parse::<f64>().unwrap_or(0.0);
+                    records.push((time, eq, upnl));
+                }
+            }
+        }
+    }
+    // 只保留最近500条
+    if records.len() > 500 {
+        records = records[records.len()-500..].to_vec();
+    }
+    records
 }
 
 fn save_equity_csv(equity: f64, upnl: f64) {
@@ -444,6 +473,13 @@ async fn main() {
         state.total_fees = loaded_fees;
     }
 
+    // 加载历史曲线数据
+    let loaded_equity = load_equity_csv();
+    if !loaded_equity.is_empty() {
+        log.log(&format!("[加载] 历史曲线数据: {} 条", loaded_equity.len()), "INFO", Some("cyan"));
+        state.equity_history = loaded_equity;
+    }
+
     // 启动时同步真实持仓
     sync_positions_from_exchange(&rest, &log, &mut state).await;
 
@@ -541,8 +577,13 @@ async fn main() {
         let upnl = *shared_upnl.read();
         update_web_dashboard(&web, &state, equity, ret_pct, upnl);
 
-        // 每分钟保存权益曲线到CSV
+        // 每分钟保存权益曲线到CSV + 内存
         save_equity_csv(equity, upnl);
+        let time_label = chrono::Local::now().format("%H:%M").to_string();
+        state.equity_history.push((time_label, equity, upnl));
+        if state.equity_history.len() > 500 {
+            state.equity_history.remove(0);
+        }
 
         // 等待下一轮
         tokio::time::sleep(std::time::Duration::from_secs(state.loop_interval)).await;
@@ -1210,6 +1251,9 @@ fn update_web_dashboard(web: &Arc<WebState>, state: &StrategyState, equity: f64,
         "return_pct": ret_pct,
         "server_name": "MA均线策略",
         "strategies": strategies,
+        "equity_history": state.equity_history.iter().map(|(t, eq, _)| {
+            json!({"l": t, "p": eq - state.init_equity, "b": eq})
+        }).collect::<Vec<_>>(),
         "today": {
             "count": today_trades.len(),
             "success_count": today_wins,
