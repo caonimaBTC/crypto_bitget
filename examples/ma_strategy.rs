@@ -66,6 +66,7 @@ struct StrategyConfig {
     stop_loss_pct: Option<f64>,
     loop_interval_secs: Option<u64>,
     warmup_rounds: Option<u64>,
+    blacklist: Option<String>,          // 黑名单币种，逗号分隔: "LINK,DOGE,SHIB"
 }
 
 // ==================== 策略状态 ====================
@@ -86,7 +87,8 @@ struct StrategyState {
     allow_short: bool,
     stop_loss_pct: f64,
     loop_interval: u64,
-    warmup_rounds: u64,        // 热机轮数，前N轮只观察不交易
+    warmup_rounds: u64,
+    blacklist: Vec<String>,    // 黑名单币种
 
     // 运行状态
     run_count: u64,
@@ -141,7 +143,7 @@ impl StrategyState {
             top_n: None, top_coins: None, kline_limit: None, ma_params: None,
             min_signals: None, min_win_rate: None, min_profit_factor: None,
             max_mdd: None, position_ratio: None, leverage: None, fixed_capital: None,
-            allow_short: None, stop_loss_pct: None, loop_interval_secs: None, warmup_rounds: None,
+            allow_short: None, stop_loss_pct: None, loop_interval_secs: None, warmup_rounds: None, blacklist: None,
         });
 
         let ma_str = c.ma_params.unwrap_or_else(|| "5_20,10_30,20_60,25_99".into());
@@ -169,6 +171,8 @@ impl StrategyState {
             stop_loss_pct: c.stop_loss_pct.unwrap_or(5.0),
             loop_interval: c.loop_interval_secs.unwrap_or(60),
             warmup_rounds: c.warmup_rounds.unwrap_or(3),
+            blacklist: c.blacklist.unwrap_or_default()
+                .split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect(),
             run_count: 0,
             init_equity: 0.0,
             whitelist: vec![],
@@ -342,6 +346,9 @@ async fn main() {
     log.log(&format!("MA参数: {:?}", state.ma_params), "INFO", None);
     log.log(&format!("白名单: Top{} | 固定本金: {}U | 杠杆: {}x | 止损: {}% | 热机: {}轮",
         state.top_coins, state.fixed_capital, state.leverage, state.stop_loss_pct, state.warmup_rounds), "INFO", None);
+    if !state.blacklist.is_empty() {
+        log.log(&format!("黑名单: {:?}", state.blacklist), "INFO", Some("yellow"));
+    }
 
     // 获取初始余额
     let bal = rest.get_usdt_balance().await;
@@ -421,7 +428,7 @@ async fn main() {
             state.run_count, equity, ret_pct, state.whitelist.len(), state.positions.len()), "INFO", None);
 
         // Step 1: 获取 Top40 标的（每分钟）
-        let top_symbols = get_top_symbols(&rest, state.top_n).await;
+        let top_symbols = get_top_symbols(&rest, state.top_n, &state.blacklist).await;
         if top_symbols.is_empty() {
             log.log("标的池为空，跳过", "WARN", Some("yellow"));
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -523,7 +530,7 @@ async fn get_total_equity(rest: &BitgetRestClient) -> f64 {
 
 // ==================== Step 1: 获取 Top N 标的 ====================
 
-async fn get_top_symbols(rest: &BitgetRestClient, top_n: usize) -> Vec<(String, f64)> {
+async fn get_top_symbols(rest: &BitgetRestClient, top_n: usize, blacklist: &[String]) -> Vec<(String, f64)> {
     let result = rest.get_all_tickers().await;
     let tickers = match result.get("Ok").and_then(|v| v.as_array()) {
         Some(arr) => arr,
@@ -534,6 +541,9 @@ async fn get_top_symbols(rest: &BitgetRestClient, top_n: usize) -> Vec<(String, 
         .filter_map(|t| {
             let sym = t.get("symbol")?.as_str()?;
             if !sym.ends_with("USDT") { return None; }
+            // 黑名单过滤
+            let coin = sym.replace("_USDT", "");
+            if blacklist.iter().any(|b| b == &coin) { return None; }
             let qv = t.get("quote_volume")?.as_f64().unwrap_or(0.0);
             if qv > 0.0 { Some((sym.to_string(), qv)) } else { None }
         })
