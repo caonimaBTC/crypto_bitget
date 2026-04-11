@@ -64,9 +64,12 @@ struct StrategyConfig {
     fixed_capital: Option<f64>,
     allow_short: Option<bool>,
     stop_loss_pct: Option<f64>,
+    trail_trigger_pct: Option<f64>,     // 移动止盈触发阈值，0=关闭
+    trail_dd_pct: Option<f64>,          // 移动止盈回撤平仓
+    cooldown_minutes: Option<u64>,      // 平仓后冷却分钟数
     loop_interval_secs: Option<u64>,
     warmup_rounds: Option<u64>,
-    blacklist: Option<String>,          // 黑名单币种，逗号分隔: "LINK,DOGE,SHIB"
+    blacklist: Option<String>,
 }
 
 // ==================== 策略状态 ====================
@@ -86,10 +89,14 @@ struct StrategyState {
     fixed_capital: f64,
     allow_short: bool,
     stop_loss_pct: f64,
+    trail_trigger_pct: f64,
+    trail_dd_pct: f64,
+    cooldown_ms: u64,
     loop_interval: u64,
     warmup_rounds: u64,
-    blacklist: Vec<String>,              // 配置文件永久黑名单
+    blacklist: Vec<String>,
     auto_blacklist: HashMap<String, u64>, // 动态黑名单 {coin: 过期时间戳ms}
+    cooldowns: HashMap<String, u64>,      // 平仓冷却 {symbol: 可开仓时间戳ms}
 
     // 运行状态
     run_count: u64,
@@ -145,7 +152,7 @@ impl StrategyState {
             top_n: None, top_coins: None, kline_limit: None, ma_params: None,
             min_signals: None, min_win_rate: None, min_profit_factor: None,
             max_mdd: None, position_ratio: None, leverage: None, fixed_capital: None,
-            allow_short: None, stop_loss_pct: None, loop_interval_secs: None, warmup_rounds: None, blacklist: None,
+            allow_short: None, stop_loss_pct: None, trail_trigger_pct: None, trail_dd_pct: None, cooldown_minutes: None, loop_interval_secs: None, warmup_rounds: None, blacklist: None,
         });
 
         let ma_str = c.ma_params.unwrap_or_else(|| "5_20,10_30,20_60,25_99".into());
@@ -171,11 +178,15 @@ impl StrategyState {
             fixed_capital: c.fixed_capital.unwrap_or(500.0),
             allow_short: c.allow_short.unwrap_or(true),
             stop_loss_pct: c.stop_loss_pct.unwrap_or(5.0),
+            trail_trigger_pct: c.trail_trigger_pct.unwrap_or(5.0),
+            trail_dd_pct: c.trail_dd_pct.unwrap_or(2.0),
+            cooldown_ms: c.cooldown_minutes.unwrap_or(60) * 60 * 1000,
             loop_interval: c.loop_interval_secs.unwrap_or(60),
             warmup_rounds: c.warmup_rounds.unwrap_or(3),
             blacklist: c.blacklist.unwrap_or_default()
                 .split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect(),
             auto_blacklist: HashMap::new(),
+            cooldowns: HashMap::new(),
             run_count: 0,
             init_equity: 0.0,
             whitelist: vec![],
@@ -441,8 +452,9 @@ async fn main() {
     let mut state = StrategyState::new(config.strategy);
 
     log.log(&format!("MA参数: {:?}", state.ma_params), "INFO", None);
-    log.log(&format!("白名单: Top{} | 固定本金: {}U | 杠杆: {}x | 止损: {}% | 热机: {}轮",
-        state.top_coins, state.fixed_capital, state.leverage, state.stop_loss_pct, state.warmup_rounds), "INFO", None);
+    log.log(&format!("白名单: Top{} | 固定本金: {}U | 杠杆: {}x | 止损: {}% | 移动止盈: {}%/{}% | 冷却: {}分钟",
+        state.top_coins, state.fixed_capital, state.leverage, state.stop_loss_pct,
+        state.trail_trigger_pct, state.trail_dd_pct, state.cooldown_ms / 60000), "INFO", None);
     if !state.blacklist.is_empty() {
         log.log(&format!("黑名单: {:?}", state.blacklist), "INFO", Some("yellow"));
     }
@@ -934,6 +946,9 @@ async fn rebalance(
             let coin_name = record.coin.clone();
             state.trade_log.push(record);
             state.positions.remove(sym);
+            // 冷却防止信号抖动反复开平
+            state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms);
+            log.log(&format!("[冷却] {} 平仓后冷却{}分钟", coin_name, state.cooldown_ms / 60000), "INFO", None);
             // 亏损时检查是否需要自动拉黑
             if pnl_usd <= 0.0 {
                 check_auto_blacklist(state, &coin_name, log);
@@ -960,7 +975,11 @@ async fn rebalance(
         .collect();
 
     let to_open: Vec<(&String, &String)> = signals.iter()
-        .filter(|(sym, _)| !state.positions.contains_key(*sym) && !real_syms.contains(sym))
+        .filter(|(sym, _)| {
+            !state.positions.contains_key(*sym)
+            && !real_syms.contains(sym)
+            && !state.cooldowns.get(*sym).map_or(false, |&t| timestamp_ms() < t)
+        })
         .collect();
 
     if to_open.is_empty() { return; }
@@ -1113,6 +1132,39 @@ async fn check_stop_loss(
         let mut pnl_pct = (price - pos.entry_price) / pos.entry_price * 100.0;
         if pos.side == "short" { pnl_pct = -pnl_pct; }
 
+        // 更新最高浮盈
+        if let Some(p) = state.positions.get_mut(&sym) {
+            if pnl_pct > p.max_pnl_pct { p.max_pnl_pct = pnl_pct; }
+        }
+        let max_pnl = state.positions.get(&sym).map(|p| p.max_pnl_pct).unwrap_or(0.0);
+
+        // 移动止盈检查
+        if state.trail_trigger_pct > 0.0 && max_pnl >= state.trail_trigger_pct
+            && (max_pnl - pnl_pct) >= state.trail_dd_pct {
+            let result = rest.close_position(&sym, None).await;
+            let direction = if pos.side == "long" { "多" } else { "空" };
+            if result.get("Ok").is_some() {
+                let notional = pos.amount * state.leverage as f64;
+                let fee = notional * 0.0006;
+                let pnl_usd = notional * pnl_pct / 100.0 - fee;
+                log.log(&format!("[移动止盈] {} 平{} | 最高{:.1}%->现{:.1}% | ${:.2} | 手续费: ${:.2}",
+                    pos.coin, direction, max_pnl, pnl_pct, pnl_usd, fee), "INFO", Some("green"));
+                let record = TradeRecord {
+                    time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
+                    coin: pos.coin.clone(), side: direction.into(),
+                    entry: pos.entry_price, exit_price: price, pnl_pct, pnl_usd,
+                    reason: format!("移动止盈(最高{:.1}%)", max_pnl),
+                };
+                save_trade_csv(&record);
+                state.trade_log.push(record);
+                state.total_fees += fee;
+                state.positions.remove(&sym);
+                state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms);
+            }
+            continue;
+        }
+
+        // 止损检查
         if pnl_pct <= -state.stop_loss_pct {
             let result = rest.close_position(&sym, None).await;
             let direction = if pos.side == "long" { "多" } else { "空" };
@@ -1139,6 +1191,7 @@ async fn check_stop_loss(
                 state.trade_log.push(record);
                 state.total_fees += sl_fee;
                 state.positions.remove(&sym);
+                state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms);
                 check_auto_blacklist(state, &coin_name, log);
             } else {
                 log.log(&format!("[止损] {} 平仓失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));
