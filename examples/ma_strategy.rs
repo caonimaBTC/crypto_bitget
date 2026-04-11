@@ -1127,10 +1127,19 @@ async fn check_stop_loss(
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0);
 
-        if price <= 0.0 { continue; }
+        if price <= 0.0 {
+            log.log(&format!("[止损检查] {} 获取价格失败，跳过", pos.coin), "WARN", Some("yellow"));
+            continue;
+        }
 
         let mut pnl_pct = (price - pos.entry_price) / pos.entry_price * 100.0;
         if pos.side == "short" { pnl_pct = -pnl_pct; }
+
+        // 打印止损检查状态
+        if pnl_pct < -2.0 || pnl_pct > 3.0 {
+            log.log(&format!("[止损检查] {} | 入场:{:.4} | 现价:{:.4} | 盈亏:{:.2}% | 最高:{:.2}%",
+                pos.coin, pos.entry_price, price, pnl_pct, pos.max_pnl_pct), "INFO", None);
+        }
 
         // 更新最高浮盈
         if let Some(p) = state.positions.get_mut(&sym) {
