@@ -571,7 +571,7 @@ async fn main() {
         // Step 3: 计算穿叉信号（每分钟）
         let signals = calc_signals(&rest, &log, &state).await;
 
-        // Step 4: 调仓（热机期只观察不交易）
+        // Step 4: 调仓（热机期只观察不交易，但止损始终生效）
         if state.run_count <= state.warmup_rounds {
             log.log(&format!("[热机] 第 {}/{} 轮，只观察不交易", state.run_count, state.warmup_rounds), "INFO", Some("yellow"));
         } else {
@@ -580,10 +580,10 @@ async fn main() {
 
             rebalance(&rest, &log, &mut state, &signals, equity,
                       ctrl_opening_stopped, ctrl_force_closing).await;
-
-            // Step 5: 检查止损
-            check_stop_loss(&rest, &log, &mut state).await;
         }
+
+        // Step 5: 止损+移动止盈（始终检查，不受热机影响）
+        check_stop_loss(&rest, &log, &mut state).await;
 
         // 更新 Web 面板
         let upnl = *shared_upnl.read();
@@ -1107,6 +1107,11 @@ async fn check_stop_loss(
     if state.stop_loss_pct <= 0.0 { return; }
 
     let to_check: Vec<String> = state.positions.keys().cloned().collect();
+    if !to_check.is_empty() {
+        let coins: Vec<String> = state.positions.values().map(|p| p.coin.clone()).collect();
+        log.tlog("sl_check", &format!("[止损检查] 检查 {} 个持仓: {:?}", to_check.len(), coins),
+            None, 300.0, "DEBUG", false);
+    }
 
     for sym in to_check {
         let pos = match state.positions.get(&sym) {
