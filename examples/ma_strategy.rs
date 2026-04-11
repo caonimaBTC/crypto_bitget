@@ -370,7 +370,7 @@ fn check_auto_blacklist(state: &mut StrategyState, coin: &str, log: &Logger) {
     let today_str = chrono::Local::now().format("%m-%d").to_string();
     let yesterday_str = (chrono::Local::now() - chrono::Duration::hours(24)).format("%m-%d").to_string();
     let losses_24h = state.trade_log.iter()
-        .filter(|t| t.coin == coin && t.pnl_usd <= 0.0
+        .filter(|t| t.coin == coin && t.pnl_usd < -1.0
             && (t.time.starts_with(&today_str) || t.time.starts_with(&yesterday_str)))
         .count();
 
@@ -773,8 +773,19 @@ async fn calc_signals(
         state.whitelist.len(), state.positions.len(), state.allow_short), "INFO", None);
 
     // 合并白名单 + 已持仓的币（防止白名单变化导致意外平仓）
+    // 但黑名单里的币不加入，让它信号消失触发平仓
     let mut check_list: Vec<WhitelistItem> = state.whitelist.clone();
     for (sym, pos) in &state.positions {
+        // 黑名单的币不保持信号 → 触发"信号消失"平仓
+        let coin = pos.coin.to_uppercase();
+        if state.blacklist.iter().any(|b| b == &coin) {
+            log.log(&format!("[黑名单] {} 在永久黑名单中，不保持信号，将平仓", pos.coin), "WARN", Some("red"));
+            continue;
+        }
+        if state.auto_blacklist.contains_key(&coin) {
+            log.log(&format!("[黑名单] {} 在自动黑名单中，不保持信号，将平仓", pos.coin), "WARN", Some("red"));
+            continue;
+        }
         if !check_list.iter().any(|w| w.symbol == *sym) {
             check_list.push(WhitelistItem {
                 symbol: sym.clone(),
