@@ -180,7 +180,7 @@ impl StrategyState {
             stop_loss_pct: c.stop_loss_pct.unwrap_or(5.0),
             trail_trigger_pct: c.trail_trigger_pct.unwrap_or(5.0),
             trail_dd_pct: c.trail_dd_pct.unwrap_or(2.0),
-            cooldown_ms: c.cooldown_minutes.unwrap_or(60) * 60 * 1000,
+            cooldown_ms: c.cooldown_minutes.unwrap_or(0) * 60 * 1000,
             loop_interval: c.loop_interval_secs.unwrap_or(60),
             warmup_rounds: c.warmup_rounds.unwrap_or(3),
             blacklist: c.blacklist.unwrap_or_default()
@@ -947,7 +947,7 @@ async fn rebalance(
             state.trade_log.push(record);
             state.positions.remove(sym);
             // 冷却防止信号抖动反复开平
-            state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms);
+            if state.cooldown_ms > 0 { state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms); }
             log.log(&format!("[冷却] {} 平仓后冷却{}分钟", coin_name, state.cooldown_ms / 60000), "INFO", None);
             // 亏损时检查是否需要自动拉黑
             if pnl_usd <= 0.0 {
@@ -1159,7 +1159,7 @@ async fn check_stop_loss(
                 state.trade_log.push(record);
                 state.total_fees += fee;
                 state.positions.remove(&sym);
-                state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms);
+                if state.cooldown_ms > 0 { state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms); }
             }
             continue;
         }
@@ -1191,7 +1191,7 @@ async fn check_stop_loss(
                 state.trade_log.push(record);
                 state.total_fees += sl_fee;
                 state.positions.remove(&sym);
-                state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms);
+                if state.cooldown_ms > 0 { state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms); }
                 check_auto_blacklist(state, &coin_name, log);
             } else {
                 log.log(&format!("[止损] {} 平仓失败: {:?}", pos.coin, result.get("Err")), "ERROR", Some("red"));
