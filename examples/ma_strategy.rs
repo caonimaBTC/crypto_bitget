@@ -70,6 +70,9 @@ struct StrategyConfig {
     loop_interval_secs: Option<u64>,
     warmup_rounds: Option<u64>,
     blacklist: Option<String>,
+    signal_mode: Option<String>,        // "ma_cross" or "price_break"
+    consec_loss_reduce: Option<u32>,    // 连亏N次仓位减半, 0=不启用
+    time_stop_hours: Option<f64>,       // 持仓超N小时未盈利平仓, 0=不启用
 }
 
 // ==================== 策略状态 ====================
@@ -95,8 +98,12 @@ struct StrategyState {
     loop_interval: u64,
     warmup_rounds: u64,
     blacklist: Vec<String>,
-    auto_blacklist: HashMap<String, u64>, // 动态黑名单 {coin: 过期时间戳ms}
-    cooldowns: HashMap<String, u64>,      // 平仓冷却 {symbol: 可开仓时间戳ms}
+    signal_mode: String,              // "ma_cross" or "price_break"
+    consec_loss_reduce: u32,          // 连亏N次仓位减半
+    time_stop_hours: f64,             // 超时平仓
+    consec_losses: u32,               // 当前连续亏损次数
+    auto_blacklist: HashMap<String, u64>,
+    cooldowns: HashMap<String, u64>,
 
     // 运行状态
     run_count: u64,
@@ -152,7 +159,7 @@ impl StrategyState {
             top_n: None, top_coins: None, kline_limit: None, ma_params: None,
             min_signals: None, min_win_rate: None, min_profit_factor: None,
             max_mdd: None, position_ratio: None, leverage: None, fixed_capital: None,
-            allow_short: None, stop_loss_pct: None, trail_trigger_pct: None, trail_dd_pct: None, cooldown_minutes: None, loop_interval_secs: None, warmup_rounds: None, blacklist: None,
+            allow_short: None, stop_loss_pct: None, trail_trigger_pct: None, trail_dd_pct: None, cooldown_minutes: None, loop_interval_secs: None, warmup_rounds: None, blacklist: None, signal_mode: None, consec_loss_reduce: None, time_stop_hours: None,
         });
 
         let ma_str = c.ma_params.unwrap_or_else(|| "5_20,10_30,20_60,25_99".into());
@@ -185,6 +192,10 @@ impl StrategyState {
             warmup_rounds: c.warmup_rounds.unwrap_or(3),
             blacklist: c.blacklist.unwrap_or_default()
                 .split(',').map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty()).collect(),
+            signal_mode: c.signal_mode.unwrap_or_else(|| "ma_cross".into()),
+            consec_loss_reduce: c.consec_loss_reduce.unwrap_or(0),
+            time_stop_hours: c.time_stop_hours.unwrap_or(0.0),
+            consec_losses: 0,
             auto_blacklist: HashMap::new(),
             cooldowns: HashMap::new(),
             run_count: 0,
@@ -813,49 +824,75 @@ async fn calc_signals(
 
         if closes.len() < item.best_slow + 1 { continue; }
 
-        let fast_cur = calc_ma(&closes, item.best_fast).unwrap_or(0.0);
-        let fast_prev = calc_ma(&closes[..closes.len()-1], item.best_fast).unwrap_or(0.0);
         let slow_cur = calc_ma(&closes, item.best_slow).unwrap_or(0.0);
         let slow_prev = calc_ma(&closes[..closes.len()-1], item.best_slow).unwrap_or(0.0);
 
         if slow_cur == 0.0 { continue; }
 
-        let diff_pct = (fast_cur - slow_cur) / slow_cur * 100.0;
-        let cross_up = fast_prev <= slow_prev && fast_cur > slow_cur;
-        let cross_down = fast_prev >= slow_prev && fast_cur < slow_cur;
+        if state.signal_mode == "price_break" {
+            // ===== v4: 价格突破均线 =====
+            // 做多: 上根收盘在慢线下, 这根收盘在慢线上
+            // 做空: 上根收盘在慢线上, 这根收盘在慢线下
+            let price = closes[closes.len() - 1];
+            let price_prev = closes[closes.len() - 2];
+            let diff_pct = (price - slow_cur) / slow_cur * 100.0;
 
-        // 穿叉信号：开新仓
-        if cross_up {
-            log.log(&format!("  [信号] {} 金叉 MA{}/{} | 差值: {:.4}%",
-                item.coin, item.best_fast, item.best_slow, diff_pct), "INFO", Some("green"));
-            signals.insert(item.symbol.clone(), "long".into());
-        } else if cross_down && state.allow_short {
-            log.log(&format!("  [信号] {} 死叉 MA{}/{} | 差值: {:.4}%",
-                item.coin, item.best_fast, item.best_slow, diff_pct), "INFO", Some("red"));
-            signals.insert(item.symbol.clone(), "short".into());
-        } else if fast_cur > slow_cur {
-            if let Some(pos) = state.positions.get(&item.symbol) {
-                if pos.side == "long" {
-                    // 持多仓 + fast仍在slow上方 → 保持做多信号
-                    signals.insert(item.symbol.clone(), "long".into());
-                    log.log(&format!("  [信号] {} MA{}/{} 多头保持 | 差值: {:.4}%",
-                        item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
+            let break_up = price_prev < slow_prev && price > slow_cur;
+            let break_down = price_prev > slow_prev && price < slow_cur;
+            let above = price > slow_cur;
+            let below = price < slow_cur;
+
+            if break_up {
+                log.log(&format!("  [信号] {} 价格突破MA{} ↑ | 偏离: {:+.4}%",
+                    item.coin, item.best_slow, diff_pct), "INFO", Some("green"));
+                signals.insert(item.symbol.clone(), "long".into());
+            } else if break_down && state.allow_short {
+                log.log(&format!("  [信号] {} 价格跌破MA{} ↓ | 偏离: {:+.4}%",
+                    item.coin, item.best_slow, diff_pct), "INFO", Some("red"));
+                signals.insert(item.symbol.clone(), "short".into());
+            } else if above {
+                if let Some(pos) = state.positions.get(&item.symbol) {
+                    if pos.side == "long" {
+                        signals.insert(item.symbol.clone(), "long".into());
+                    }
                 }
-                // 持空仓 + fast在slow上方 → 不插入信号 → 触发"信号消失"平仓
-            }
-        } else if fast_cur < slow_cur {
-            if let Some(pos) = state.positions.get(&item.symbol) {
-                if pos.side == "short" && state.allow_short {
-                    // 持空仓 + fast仍在slow下方 → 保持做空信号
-                    signals.insert(item.symbol.clone(), "short".into());
-                    log.log(&format!("  [信号] {} MA{}/{} 空头保持 | 差值: {:.4}%",
-                        item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
+            } else if below {
+                if let Some(pos) = state.positions.get(&item.symbol) {
+                    if pos.side == "short" && state.allow_short {
+                        signals.insert(item.symbol.clone(), "short".into());
+                    }
                 }
-                // 持多仓 + fast在slow下方 → 不插入信号 → 触发"信号消失"平仓
             }
         } else {
-            log.log(&format!("  [信号] {} MA{}/{} 无叉 | 差值: {:.4}%",
-                item.coin, item.best_fast, item.best_slow, diff_pct), "DEBUG", None);
+            // ===== 原版: MA穿叉 =====
+            let fast_cur = calc_ma(&closes, item.best_fast).unwrap_or(0.0);
+            let fast_prev = calc_ma(&closes[..closes.len()-1], item.best_fast).unwrap_or(0.0);
+
+            let diff_pct = (fast_cur - slow_cur) / slow_cur * 100.0;
+            let cross_up = fast_prev <= slow_prev && fast_cur > slow_cur;
+            let cross_down = fast_prev >= slow_prev && fast_cur < slow_cur;
+
+            if cross_up {
+                log.log(&format!("  [信号] {} 金叉 MA{}/{} | 差值: {:.4}%",
+                    item.coin, item.best_fast, item.best_slow, diff_pct), "INFO", Some("green"));
+                signals.insert(item.symbol.clone(), "long".into());
+            } else if cross_down && state.allow_short {
+                log.log(&format!("  [信号] {} 死叉 MA{}/{} | 差值: {:.4}%",
+                    item.coin, item.best_fast, item.best_slow, diff_pct), "INFO", Some("red"));
+                signals.insert(item.symbol.clone(), "short".into());
+            } else if fast_cur > slow_cur {
+                if let Some(pos) = state.positions.get(&item.symbol) {
+                    if pos.side == "long" {
+                        signals.insert(item.symbol.clone(), "long".into());
+                    }
+                }
+            } else if fast_cur < slow_cur {
+                if let Some(pos) = state.positions.get(&item.symbol) {
+                    if pos.side == "short" && state.allow_short {
+                        signals.insert(item.symbol.clone(), "short".into());
+                    }
+                }
+            }
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1041,8 +1078,17 @@ async fn rebalance(
         let min_qty = inst.and_then(|i| i.get("min_qty")).and_then(|v| v.as_f64()).unwrap_or(0.001);
         let step = inst.and_then(|i| i.get("step_size")).and_then(|v| v.as_f64()).unwrap_or(0.001);
 
+        // 连亏缩仓: 仓位减半
+        let actual_amt = if state.consec_loss_reduce > 0 && state.consec_losses >= state.consec_loss_reduce {
+            log.log(&format!("[风控] 连亏{}次, 仓位减半 {:.1}U → {:.1}U",
+                state.consec_losses, single_amt, single_amt * 0.5), "WARN", Some("yellow"));
+            single_amt * 0.5
+        } else {
+            single_amt
+        };
+
         // 名义值 = 保证金 × 杠杆
-        let notional = single_amt * state.leverage as f64;
+        let notional = actual_amt * state.leverage as f64;
         let qty_raw = notional / price;
         let qty = (qty_raw / step).floor() * step;
 
@@ -1183,10 +1229,39 @@ async fn check_stop_loss(
                 save_trade_csv(&record);
                 state.trade_log.push(record);
                 state.total_fees += fee;
+                state.consec_losses = 0; // 盈利平仓重置连亏
                 state.positions.remove(&sym);
                 if state.cooldown_ms > 0 { state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms); }
             }
             continue;
+        }
+
+        // 超时未盈利平仓
+        if state.time_stop_hours > 0.0 && pnl_pct <= 0.0 {
+            let hold_hours = (timestamp_ms() - pos.open_time) as f64 / 3600000.0;
+            if hold_hours >= state.time_stop_hours {
+                let result = rest.close_position(&sym, None).await;
+                let direction = if pos.side == "long" { "多" } else { "空" };
+                if result.get("Ok").is_some() {
+                    let notional = pos.amount * state.leverage as f64;
+                    let fee = notional * 0.0006;
+                    let pnl_usd = notional * pnl_pct / 100.0 - fee;
+                    log.log(&format!("[超时平仓] {} 平{} | 持仓{:.1}h未盈利 | {:.2}% ${:.2}",
+                        pos.coin, direction, hold_hours, pnl_pct, pnl_usd), "WARN", Some("yellow"));
+                    let record = TradeRecord {
+                        time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
+                        coin: pos.coin.clone(), side: direction.into(),
+                        entry: pos.entry_price, exit_price: price, pnl_pct, pnl_usd,
+                        reason: format!("超时{:.0}h({:.1}%)", hold_hours, pnl_pct),
+                    };
+                    save_trade_csv(&record);
+                    state.trade_log.push(record);
+                    state.total_fees += fee;
+                    state.consec_losses += 1;
+                    state.positions.remove(&sym);
+                }
+                continue;
+            }
         }
 
         // 止损检查
@@ -1198,8 +1273,8 @@ async fn check_stop_loss(
                 let sl_notional = pos.amount * state.leverage as f64;
                 let sl_fee = sl_notional * 0.0006;
                 let sl_pnl = sl_notional * pnl_pct / 100.0 - sl_fee;
-                log.log(&format!("[止损] {} 平{} | 亏损: {:.2}% ${:.2} | 手续费: ${:.2} | 入场: {} | 现价: {}",
-                    pos.coin, direction, pnl_pct, sl_pnl, sl_fee, pos.entry_price, price), "WARN", Some("red"));
+                log.log(&format!("[止损] {} 平{} | 亏损: {:.2}% ${:.2} | 连亏: {} | 手续费: ${:.2}",
+                    pos.coin, direction, pnl_pct, sl_pnl, state.consec_losses + 1, sl_fee), "WARN", Some("red"));
 
                 let record = TradeRecord {
                     time: chrono::Local::now().format("%m-%d %H:%M").to_string(),
@@ -1215,6 +1290,10 @@ async fn check_stop_loss(
                 let coin_name = record.coin.clone();
                 state.trade_log.push(record);
                 state.total_fees += sl_fee;
+                state.consec_losses += 1;
+                if state.consec_loss_reduce > 0 && state.consec_losses >= state.consec_loss_reduce {
+                    log.log(&format!("[风控] 连亏{}次, 下次仓位减半", state.consec_losses), "WARN", Some("red"));
+                }
                 state.positions.remove(&sym);
                 if state.cooldown_ms > 0 { state.cooldowns.insert(sym.clone(), timestamp_ms() + state.cooldown_ms); }
                 check_auto_blacklist(state, &coin_name, log);
