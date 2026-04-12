@@ -780,8 +780,8 @@ async fn calc_signals(
 
     if state.whitelist.is_empty() && state.positions.is_empty() { return signals; }
 
-    log.log(&format!("[计算信号] 白名单: {} 个 | 持仓: {} 个 | 允许做空: {}",
-        state.whitelist.len(), state.positions.len(), state.allow_short), "INFO", None);
+    log.log(&format!("[计算信号] 模式: {} | 白名单: {} 个 | 持仓: {} 个 | 允许做空: {} | 连亏: {}",
+        state.signal_mode, state.whitelist.len(), state.positions.len(), state.allow_short, state.consec_losses), "INFO", None);
 
     // 合并白名单 + 已持仓的币（防止白名单变化导致意外平仓）
     // 但黑名单里的币不加入，让它信号消失触发平仓
